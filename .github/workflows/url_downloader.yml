@@ -3,103 +3,66 @@ name: دانلود لینک مستقیم فیلتر شده
 on:
   workflow_dispatch:
     inputs:
-      download_url:
-        description: 'آدرس فایل برای دانلود'
+      file_url:
+        description: 'لینک مستقیم فایل مورد نظر'
         required: true
         type: string
+      zip_password:
+        description: 'رمز عبور برای فایل فشرده (اختیاری - در صورت خالی گذاشتن، فایل بدون رمز فشرده می‌شود)'
+        required: false
+        type: string
       output_folder:
-        description: 'پوشه ذخیره فایل'
+        description: 'پوشه ذخیره فایل و آرشیوها (نسبت به ریشه مخزن)'
         required: false
         type: string
         default: 'downloads'
-      output_filename:
-        description: 'نام دلخواه برای فایل (در صورت خالی بودن، نام اصلی استفاده می‌شود)'
-        required: false
-        type: string
-        default: ''
-      archive_name:
-        description: 'نام پایه برای بایگانی RAR (فقط در صورت تقسیم فایل استفاده می‌شود)'
-        required: false
-        type: string
-        default: ''
+
+permissions:
+  contents: write
 
 jobs:
-  download-and-conditionally-split:
+  leech-split-file:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v5
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install RAR
-        run: sudo apt-get update && sudo apt-get install -y rar
+          fetch-depth: 1
 
       - name: Create output folder
-        run: mkdir -p "${{ github.event.inputs.output_folder }}"
+        run: mkdir -p "${{ inputs.output_folder }}"
+
+      - name: Install 7z
+        run: sudo apt-get update && sudo apt-get install -y p7zip-full
 
       - name: Download file
-        id: download
         run: |
-          URL="${{ github.event.inputs.download_url }}"
-          FOLDER="${{ github.event.inputs.output_folder }}"
-          CUSTOM_NAME="${{ github.event.inputs.output_filename }}"
-          
-          cd "$FOLDER"
-          if [ -n "$CUSTOM_NAME" ]; then
-            FILENAME="$CUSTOM_NAME"
-          else
-            FILENAME=$(basename "$URL")
-          fi
-          
-          wget -O "$FILENAME" "$URL"
-          
-          # Store filename and size (in bytes) for next steps
-          echo "filename=$FILENAME" >> $GITHUB_OUTPUT
-          echo "size_bytes=$(stat -c%s "$FILENAME")" >> $GITHUB_OUTPUT
-          echo "Downloaded: $FILENAME ($(numfmt --to=iec $size_bytes))"
+          cd "${{ inputs.output_folder }}"
+          curl -L --fail --retry 3 -o original_file "${{ inputs.file_url }}"
 
-      - name: Conditional split (if file > 99 MB)
-        id: split
+      - name: Create encrypted split archive
         run: |
-          FOLDER="${{ github.event.inputs.output_folder }}"
-          FILENAME="${{ steps.download.outputs.filename }}"
-          SIZE_BYTES="${{ steps.download.outputs.size_bytes }}"
-          SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1048576" | bc)
-          THRESHOLD_MB=99
-          
-          cd "$FOLDER"
-          
-          if (( $(echo "$SIZE_MB > $THRESHOLD_MB" | bc -l) )); then
-            echo "File size ${SIZE_MB}MB exceeds 99MB – splitting into 95MB RAR parts."
-            
-            # If archive_name is empty, use the file's base name (without extension)
-            INPUT_ARCHIVE_NAME="${{ github.event.inputs.archive_name }}"
-            if [ -n "$INPUT_ARCHIVE_NAME" ]; then
-              ARCHIVE_NAME="$INPUT_ARCHIVE_NAME"
-            else
-              BASENAME="${FILENAME%.*}"
-              ARCHIVE_NAME="$BASENAME"
-            fi
-            
-            rar a -v95m -m5 -ep1 "${ARCHIVE_NAME}.rar" "$FILENAME"
-            
-            # Remove original file after successful split
-            rm "$FILENAME"
-            
-            echo "split_done=true" >> $GITHUB_OUTPUT
-            echo "Split completed. Parts created:"
-            ls -lh "${ARCHIVE_NAME}.part"*.rar
+          cd "${{ inputs.output_folder }}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          PASSWORD="${{ inputs.zip_password }}"
+          if [ -n "$PASSWORD" ]; then
+            7z a -p"$PASSWORD" -mhe=on -mx=3 -v85m "archive_${TIMESTAMP}.7z" original_file
           else
-            echo "File size ${SIZE_MB}MB is ≤99MB – keeping original file (no RAR)."
-            echo "split_done=false" >> $GITHUB_OUTPUT
+            7z a -mx=3 -v85m "archive_${TIMESTAMP}.7z" original_file
+          fi
+          # If only one chunk, rename it to .7z (no .001)
+          if [ -f "archive_${TIMESTAMP}.7z.001" ] && [ ! -f "archive_${TIMESTAMP}.7z.002" ]; then
+            mv "archive_${TIMESTAMP}.7z.001" "archive_${TIMESTAMP}.7z"
           fi
 
-      - name: Commit and push to repository
+      - name: Remove original downloaded file
+        run: rm -f "${{ inputs.output_folder }}/original_file"
+
+      - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${{ github.event.inputs.output_folder }}"
-          git commit -m "Add file from ${{ github.event.inputs.download_url }} [skip ci]" || echo "No changes to commit"
+          git add "${{ inputs.output_folder }}"
+          git commit -m "Add file from ${{ inputs.file_url }} [skip ci]" || echo "No changes to commit"
           git push
